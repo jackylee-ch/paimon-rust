@@ -22,8 +22,9 @@ use crate::spec::core_options::{
 };
 use crate::spec::types::{ArrayType, DataType, MapType, MultisetType, RowType, VarCharType};
 use crate::spec::{
-    remove_field_scoped_options, rename_field_scoped_options, AggregationConfig, BlobType,
-    ColumnMove, ColumnMoveType, PartialUpdateConfig,
+    remove_field_scoped_options, rename_field_scoped_options,
+    validate_no_aggregation_on_sequence_field, AggregationConfig, BlobType, ColumnMove,
+    ColumnMoveType, PartialUpdateConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
@@ -579,6 +580,7 @@ impl TableSchema {
         )?;
         PartialUpdateConfig::new(&new_schema.options)
             .validate_create_mode(!new_schema.primary_keys.is_empty())?;
+        validate_no_aggregation_on_sequence_field(&new_schema.options)?;
         AggregationConfig::new(&new_schema.options)
             .validate_create_mode(&new_schema.primary_keys, &new_schema.fields)?;
         Schema::validate_first_row_changelog_producer(&new_schema.options)?;
@@ -1088,6 +1090,7 @@ impl Schema {
         Self::validate_blob_fields(&fields, &partition_keys, &options)?;
         Self::validate_vector_store_fields(&fields, &partition_keys, &options)?;
         PartialUpdateConfig::new(&options).validate_create_mode(!primary_keys.is_empty())?;
+        validate_no_aggregation_on_sequence_field(&options)?;
         AggregationConfig::new(&options).validate_create_mode(&primary_keys, &fields)?;
         Self::validate_first_row_changelog_producer(&options)?;
         Self::validate_rowkind_field(&options, &primary_keys, &fields)?;
@@ -3391,6 +3394,55 @@ mod tests {
         );
 
         assert_primary_key_index_column_changes_rejected(&table_schema, "embedding", vector_type);
+    }
+
+    #[test]
+    fn test_create_schema_rejects_aggregation_on_sequence_field_without_agg_engine() {
+        // Java `validateSequenceField` checks `fieldAggFunc(field) == null` for
+        // every merge engine, so the default (deduplicate) engine must reject
+        // this too, not just `merge-engine=aggregation`.
+        let err = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("ts", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("sequence.field", "ts")
+            .option("fields.ts.aggregate-function", "sum")
+            .build()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sequence field") && message.contains("ts")),
+            "aggregation on a sequence field should be rejected on the default \
+             merge engine, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_alter_set_aggregation_on_sequence_field_rejected_without_agg_engine() {
+        let table_schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("ts", DataType::Int(IntType::new()))
+                .primary_key(["id"])
+                .option("sequence.field", "ts")
+                .build()
+                .unwrap(),
+        );
+
+        let err = table_schema
+            .apply_changes(vec![crate::spec::SchemaChange::set_option(
+                "fields.ts.aggregate-function".to_string(),
+                "sum".to_string(),
+            )])
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::ConfigInvalid { ref message }
+                if message.contains("sequence field") && message.contains("ts")),
+            "alter adding aggregation on a sequence field should be rejected, got {err:?}"
+        );
     }
 
     #[test]
