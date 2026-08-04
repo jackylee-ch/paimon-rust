@@ -974,11 +974,15 @@ impl<'a> CoreOptions<'a> {
     ///
     /// Java leaves this unset by default. When present, vector columns are
     /// written to files named `*.vector.<format>`.
-    pub fn vector_file_format(&self) -> Option<&str> {
+    /// Dedicated vector file format, normalized to lowercase.
+    ///
+    /// Mirrors Java `CoreOptions.normalizeFileFormat`, which lowercases every
+    /// file-format option so the value can be used directly in a file name.
+    pub fn vector_file_format(&self) -> Option<String> {
         self.options
             .get(VECTOR_FILE_FORMAT_OPTION)
-            .map(String::as_str)
-            .filter(|format| !format.trim().is_empty())
+            .map(|format| format.trim().to_ascii_lowercase())
+            .filter(|format| !format.is_empty())
     }
 
     pub fn vector_target_file_size(&self) -> i64 {
@@ -990,11 +994,12 @@ impl<'a> CoreOptions<'a> {
 
     /// File format for data files (e.g. "parquet", "orc", "avro", "vortex").
     /// Default is "parquet".
-    pub fn file_format(&self) -> &str {
+    pub fn file_format(&self) -> String {
         self.options
             .get(FILE_FORMAT_OPTION)
-            .map(String::as_str)
-            .unwrap_or("parquet")
+            .map(|format| format.trim().to_ascii_lowercase())
+            .filter(|format| !format.is_empty())
+            .unwrap_or_else(|| "parquet".to_string())
     }
 
     /// File compression codec (e.g. "lz4", "zstd", "snappy", "none").
@@ -1027,10 +1032,11 @@ impl<'a> CoreOptions<'a> {
     ///
     /// When `changelog-file.format` is not configured, Java Paimon falls back
     /// to the table `file.format`.
-    pub fn changelog_file_format(&self) -> &str {
+    pub fn changelog_file_format(&self) -> String {
         self.options
             .get(CHANGELOG_FILE_FORMAT_OPTION)
-            .map(String::as_str)
+            .map(|format| format.trim().to_ascii_lowercase())
+            .filter(|format| !format.is_empty())
             .unwrap_or_else(|| self.file_format())
     }
 
@@ -1221,8 +1227,8 @@ impl<'a> CoreOptions<'a> {
         self.options.contains_key(PK_VECTOR_INDEX_COLUMNS_OPTION)
     }
 
-    /// The configured PK-vector index columns, split on ',' and trimmed. Errors when
-    /// the key is present but resolves to no non-blank column.
+    /// The configured PK-vector index columns, split on ',' and trimmed. Blank tokens
+    /// are preserved so schema validation can reject malformed column lists.
     pub fn primary_key_vector_index_columns(&self) -> crate::Result<Vec<String>> {
         let raw = self
             .options
@@ -1230,17 +1236,7 @@ impl<'a> CoreOptions<'a> {
             .ok_or_else(|| crate::Error::ConfigInvalid {
                 message: "pk-vector.index.columns is not set".to_string(),
             })?;
-        let columns: Vec<String> = raw
-            .split(',')
-            .map(|c| c.trim().to_string())
-            .filter(|c| !c.is_empty())
-            .collect();
-        if columns.is_empty() {
-            return Err(crate::Error::ConfigInvalid {
-                message: "pk-vector.index.columns is set but names no column".to_string(),
-            });
-        }
-        Ok(columns)
+        Ok(raw.split(',').map(|c| c.trim().to_string()).collect())
     }
 
     /// The single PK-vector index column. The first release supports exactly one.
@@ -1639,6 +1635,52 @@ mod tests {
     }
 
     #[test]
+    fn test_file_formats_are_normalized_to_lowercase() {
+        // Java routes every file-format option through
+        // `CoreOptions.normalizeFileFormat`, which lowercases it. The value ends
+        // up in the data file name, so an uppercase option would otherwise write
+        // `data-<uuid>-0.PARQUET` where Java writes `.parquet`.
+        for raw in ["PARQUET", "Parquet", " parquet ", "parquet"] {
+            let options = HashMap::from([(FILE_FORMAT_OPTION.to_string(), raw.to_string())]);
+            assert_eq!(
+                CoreOptions::new(&options).file_format(),
+                "parquet",
+                "file.format = {raw:?} should normalize to \"parquet\""
+            );
+        }
+
+        let options = HashMap::from([(
+            CHANGELOG_FILE_FORMAT_OPTION.to_string(),
+            " AVRO ".to_string(),
+        )]);
+        assert_eq!(CoreOptions::new(&options).changelog_file_format(), "avro");
+
+        let options =
+            HashMap::from([(VECTOR_FILE_FORMAT_OPTION.to_string(), "VORTEX".to_string())]);
+        assert_eq!(
+            CoreOptions::new(&options).vector_file_format().as_deref(),
+            Some("vortex")
+        );
+    }
+
+    #[test]
+    fn test_file_format_defaults_and_blank_handling() {
+        let empty = HashMap::new();
+        assert_eq!(CoreOptions::new(&empty).file_format(), "parquet");
+        // `changelog-file.format` falls back to `file.format`, still normalized.
+        let options = HashMap::from([(FILE_FORMAT_OPTION.to_string(), "ORC".to_string())]);
+        assert_eq!(CoreOptions::new(&options).changelog_file_format(), "orc");
+
+        // A blank value is not a format: fall back rather than return "".
+        for raw in ["", "   "] {
+            let options = HashMap::from([(FILE_FORMAT_OPTION.to_string(), raw.to_string())]);
+            assert_eq!(CoreOptions::new(&options).file_format(), "parquet");
+            let options = HashMap::from([(VECTOR_FILE_FORMAT_OPTION.to_string(), raw.to_string())]);
+            assert_eq!(CoreOptions::new(&options).vector_file_format(), None);
+        }
+    }
+
+    #[test]
     fn test_parse_memory_size() {
         assert_eq!(parse_memory_size("1024"), Some(1024));
         assert_eq!(parse_memory_size("128 mb"), Some(128 * 1024 * 1024));
@@ -1950,7 +1992,7 @@ mod tests {
             ),
         ]);
         let custom_core = CoreOptions::new(&custom_options);
-        assert_eq!(custom_core.vector_file_format(), Some("vortex"));
+        assert_eq!(custom_core.vector_file_format().as_deref(), Some("vortex"));
         assert_eq!(custom_core.vector_target_file_size(), 64 * 1024 * 1024);
     }
 
@@ -2344,11 +2386,21 @@ mod tests {
     }
 
     #[test]
-    fn test_pk_vector_empty_columns_errors() {
-        let opts = HashMap::from([("pk-vector.index.columns".to_string(), "  ,  ".to_string())]);
-        let co = CoreOptions::new(&opts);
-        assert!(co.primary_key_vector_index_enabled()); // key present
-        assert!(co.primary_key_vector_index_columns().is_err());
+    fn test_pk_vector_index_columns_preserve_blank_tokens() {
+        for (value, expected) in [
+            ("embedding,", vec!["embedding", ""]),
+            (",embedding", vec!["", "embedding"]),
+            ("embedding,,", vec!["embedding", "", ""]),
+            (" ", vec![""]),
+        ] {
+            let opts = HashMap::from([("pk-vector.index.columns".to_string(), value.to_string())]);
+            assert_eq!(
+                CoreOptions::new(&opts)
+                    .primary_key_vector_index_columns()
+                    .unwrap(),
+                expected
+            );
+        }
     }
 
     #[test]
