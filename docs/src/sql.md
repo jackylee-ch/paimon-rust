@@ -1784,9 +1784,9 @@ Columns:
 
 | Column | Type | Description |
 |---|---|---|
-| `partition` | STRING | Partition spec for the file, or `NULL` for unpartitioned tables |
+| `partition` | STRING | Partition spec, formatted as a Java row cast string; `{}` for unpartitioned tables |
 | `bucket` | INT | Bucket id the file belongs to |
-| `file_path` | STRING | Data file name |
+| `file_path` | STRING | Full data file path, or `external_path` when the file has one |
 | `file_format` | STRING | Data file format, such as `parquet` or `orc` |
 | `schema_id` | BIGINT | Id of the schema the file was written with |
 | `level` | INT | LSM level of the file (`0` for unmerged files) |
