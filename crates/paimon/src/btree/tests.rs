@@ -664,25 +664,51 @@ async fn test_java_compat_varchar_no_compress() {
 }
 
 #[tokio::test]
-async fn test_java_compat_int_lz4_unsupported() {
-    let data = Bytes::from(load_testdata("btree_int_100_lz4.bin"));
-    let file_size = data.len() as u64;
+async fn test_java_compat_int_lz4() {
     let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
-    let reader_result =
-        BTreeIndexReader::open(Box::new(BytesFileRead(data)), file_size, &meta, le_int_cmp).await;
+    let reader = open_testdata("btree_int_100_lz4.bin", &meta, le_int_cmp).await;
 
-    match reader_result {
-        Err(e) => {
-            assert!(
-                e.to_string().contains("not supported") || e.to_string().contains("Unsupported"),
-                "Expected unsupported compression error, got: {e}"
-            );
-        }
-        Ok(reader) => {
-            // If reader creation succeeded (index block not compressed),
-            // data block read should fail
-            let result = reader.query_equal(&le_int_key(0)).await;
-            assert!(result.is_err(), "LZ4 data block read should fail");
-        }
+    let all = reader.all_non_null_rows().await.unwrap();
+    assert_eq!(all.len(), 100);
+
+    let bm = reader.query_equal(&le_int_key(100)).await.unwrap();
+    assert_eq!(bm.len(), 1);
+    assert!(bm.contains(50));
+
+    let bm = reader
+        .query_between(&le_int_key(10), &le_int_key(20))
+        .await
+        .unwrap();
+    assert_eq!(bm.len(), 6);
+
+    let bm = reader.query_equal(&le_int_key(1)).await.unwrap();
+    assert_eq!(bm.len(), 0);
+}
+
+/// The same data written by Java under three block codecs must decode to the
+/// same rows -- this is what makes the LZ4 path a compatibility fix rather than
+/// a new format.
+#[tokio::test]
+async fn test_java_compat_int_lz4_matches_other_codecs() {
+    let meta = BTreeIndexMeta::new(Some(le_int_key(0)), Some(le_int_key(198)), false);
+
+    let mut rows_per_codec = Vec::new();
+    for name in [
+        "btree_int_100_no_compress.bin",
+        "btree_int_100_zstd.bin",
+        "btree_int_100_lz4.bin",
+    ] {
+        let reader = open_testdata(name, &meta, le_int_cmp).await;
+        let mut rows: Vec<u64> = reader.all_non_null_rows().await.unwrap().iter().collect();
+        rows.sort_unstable();
+        rows_per_codec.push((name, rows));
+    }
+
+    let (baseline_name, baseline) = &rows_per_codec[0];
+    for (name, rows) in &rows_per_codec[1..] {
+        assert_eq!(
+            rows, baseline,
+            "{name} must decode to the same rows as {baseline_name}"
+        );
     }
 }

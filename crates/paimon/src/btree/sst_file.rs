@@ -155,7 +155,7 @@ impl SstFileWriter {
                 }
             }
             _ => {
-                // LZ4/LZO not implemented yet, fall back to no compression
+                // LZ4/LZO writing is not implemented yet, fall back to no compression
                 (Cow::Borrowed(block), BlockCompressionType::None)
             }
         }
@@ -235,6 +235,12 @@ fn decompress_block(data: &[u8], trailer: &BlockTrailer) -> io::Result<Vec<u8>> 
             }
             Ok(decompressed)
         }
+        BlockCompressionType::Lz4 => {
+            let mut cursor = Cursor::new(data);
+            let uncompressed_size = crate::btree::var_len::decode_var_int(&mut cursor)? as usize;
+            let frame_start = cursor.position() as usize;
+            decompress_lz4_frame(&data[frame_start..], uncompressed_size)
+        }
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
@@ -243,6 +249,76 @@ fn decompress_block(data: &[u8], trailer: &BlockTrailer) -> io::Result<Vec<u8>> 
             ),
         )),
     }
+}
+
+/// Number of bytes in the LZ4 frame header Paimon writes ahead of the raw block:
+/// two little-endian `i32`s holding the compressed and uncompressed lengths.
+const LZ4_FRAME_HEADER_LEN: usize = 8;
+
+/// Decode Paimon's LZ4 frame: `[compressedLen: i32le][uncompressedLen: i32le]`
+/// followed by a raw LZ4 block (`Lz4BlockCompressor` on the Java side, which is
+/// not the LZ4 frame format). `expected_size` comes from the var-int the block
+/// writer puts ahead of the frame and must agree with the header's own copy.
+fn decompress_lz4_frame(frame: &[u8], expected_size: usize) -> io::Result<Vec<u8>> {
+    if frame.len() < LZ4_FRAME_HEADER_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "LZ4 block is too short for its {LZ4_FRAME_HEADER_LEN}-byte header: {} bytes",
+                frame.len()
+            ),
+        ));
+    }
+
+    let compressed_len = i32::from_le_bytes(frame[0..4].try_into().unwrap());
+    let uncompressed_len = i32::from_le_bytes(frame[4..8].try_into().unwrap());
+    let compressed_len = usize::try_from(compressed_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Negative LZ4 compressed length: {compressed_len}"),
+        )
+    })?;
+    let uncompressed_len = usize::try_from(uncompressed_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Negative LZ4 uncompressed length: {uncompressed_len}"),
+        )
+    })?;
+
+    // The uncompressed length is stored twice -- once by the block writer as a
+    // var-int, once inside this header. Disagreement means a corrupt file.
+    if uncompressed_len != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "LZ4 length mismatch: block header says {uncompressed_len}, \
+                 block prefix says {expected_size}"
+            ),
+        ));
+    }
+
+    let payload = &frame[LZ4_FRAME_HEADER_LEN..];
+    if payload.len() < compressed_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "LZ4 block is truncated: header says {compressed_len} compressed bytes, \
+                 {} available",
+                payload.len()
+            ),
+        ));
+    }
+
+    let mut decompressed = vec![0u8; uncompressed_len];
+    let actual = lz4_flex::block::decompress_into(&payload[..compressed_len], &mut decompressed)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if actual != uncompressed_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Decompressed size mismatch: expected {uncompressed_len}, got {actual}"),
+        ));
+    }
+    Ok(decompressed)
 }
 
 /// SstFileReader reads an SST file index block for async on-demand data block loading.
