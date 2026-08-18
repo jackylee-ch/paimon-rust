@@ -64,8 +64,24 @@ fn collect_results(
         }
     }
     impl Ord for ScoredRow {
+        // Reversed on score so the heap top is the weakest candidate; among
+        // equal scores the larger row id sorts first and is therefore evicted
+        // first. Mirrors `vector_search::ScoredRow` so both backends keep the
+        // same rows for a tied score.
         fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            other.score.total_cmp(&self.score)
+            other
+                .score
+                .total_cmp(&self.score)
+                .then_with(|| self.row_id.cmp(&other.row_id))
+        }
+    }
+
+    impl ScoredRow {
+        fn is_stronger_than(&self, other: &Self) -> bool {
+            self.score
+                .total_cmp(&other.score)
+                .then_with(|| other.row_id.cmp(&self.row_id))
+                == std::cmp::Ordering::Greater
         }
     }
 
@@ -75,13 +91,15 @@ fn collect_results(
             continue;
         }
         let score = convert_distance_to_score(distance, metric);
+        let entry = ScoredRow { row_id, score };
         if min_heap.len() < top_k {
-            min_heap.push(ScoredRow { row_id, score });
-        } else if let Some(peek) = min_heap.peek() {
-            if score > peek.score {
-                min_heap.pop();
-                min_heap.push(ScoredRow { row_id, score });
-            }
+            min_heap.push(entry);
+        } else if min_heap
+            .peek()
+            .is_some_and(|weakest| entry.is_stronger_than(weakest))
+        {
+            min_heap.pop();
+            min_heap.push(entry);
         }
     }
 
@@ -498,6 +516,104 @@ mod tests {
         assert!(result.contains_key(&3));
         assert!(result.contains_key(&0));
         assert!(!result.contains_key(&2)); // 0.1 is lowest
+    }
+
+    /// Rows sharing a score must be kept by ascending row id, not by the order
+    /// the native searcher happened to return them in. Feeding the same tied
+    /// scores in two different label orders must select the same rows.
+    #[test]
+    fn test_collect_results_breaks_ties_by_row_id() {
+        // Rows 10, 20, 30 all score 0.5; row 40 scores higher and always wins.
+        let distances = vec![0.9, 0.5, 0.5, 0.5];
+
+        let forward = collect_results(
+            &[40, 10, 20, 30],
+            &distances,
+            2,
+            LuminaVectorMetric::InnerProduct,
+        );
+        let reversed = collect_results(
+            &[40, 30, 20, 10],
+            &distances,
+            2,
+            LuminaVectorMetric::InnerProduct,
+        );
+
+        let mut forward_ids: Vec<u64> = forward.keys().copied().collect();
+        forward_ids.sort_unstable();
+        let mut reversed_ids: Vec<u64> = reversed.keys().copied().collect();
+        reversed_ids.sort_unstable();
+
+        assert_eq!(
+            forward_ids, reversed_ids,
+            "tied rows must not depend on label order"
+        );
+        assert_eq!(
+            forward_ids,
+            vec![10, 40],
+            "among equal scores the smallest row id wins"
+        );
+    }
+
+    /// The same invariant when every candidate ties: the retained set is the
+    /// `top_k` smallest row ids regardless of input order.
+    #[test]
+    fn test_collect_results_all_tied_keeps_smallest_row_ids() {
+        let distances = vec![0.25; 5];
+
+        let forward = collect_results(
+            &[1, 2, 3, 4, 5],
+            &distances,
+            3,
+            LuminaVectorMetric::InnerProduct,
+        );
+        let shuffled = collect_results(
+            &[4, 1, 5, 3, 2],
+            &distances,
+            3,
+            LuminaVectorMetric::InnerProduct,
+        );
+
+        let mut forward_ids: Vec<u64> = forward.keys().copied().collect();
+        forward_ids.sort_unstable();
+        let mut shuffled_ids: Vec<u64> = shuffled.keys().copied().collect();
+        shuffled_ids.sort_unstable();
+
+        assert_eq!(forward_ids, vec![1, 2, 3]);
+        assert_eq!(shuffled_ids, vec![1, 2, 3]);
+    }
+
+    /// A NaN distance must not make the comparison inconsistent. `total_cmp` is
+    /// a total order, which is the same treatment `vector_search` gives it, so
+    /// the selection stays independent of the order the searcher returned the
+    /// pairs in. Both arrays are permuted together so the pairing is preserved.
+    #[test]
+    fn test_collect_results_with_nan_is_order_independent() {
+        let forward = collect_results(
+            &[7, 8, 9],
+            &[f32::NAN, 0.5, 0.5],
+            2,
+            LuminaVectorMetric::InnerProduct,
+        );
+        let reversed = collect_results(
+            &[9, 8, 7],
+            &[0.5, 0.5, f32::NAN],
+            2,
+            LuminaVectorMetric::InnerProduct,
+        );
+
+        let mut forward_ids: Vec<u64> = forward.keys().copied().collect();
+        forward_ids.sort_unstable();
+        let mut reversed_ids: Vec<u64> = reversed.keys().copied().collect();
+        reversed_ids.sort_unstable();
+
+        assert_eq!(
+            forward_ids, reversed_ids,
+            "a NaN score must not make the result depend on the input order"
+        );
+        // total_cmp ranks a positive NaN above every real score, so row 7 is
+        // retained and the 0.5 tie is settled by the smaller row id.
+        assert_eq!(forward_ids, vec![7, 8]);
     }
 
     #[test]
