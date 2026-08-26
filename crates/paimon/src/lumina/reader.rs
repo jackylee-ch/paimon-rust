@@ -45,6 +45,39 @@ fn convert_distance_to_score(distance: f32, metric: LuminaVectorMetric) -> f32 {
     }
 }
 
+/// Order two search scores, best last, with NaN ranked below every real score.
+///
+/// This is the score-domain mirror of `vindex::pkvector::metric`'s
+/// `java_float_compare`, which ranks a NaN *distance* worst. `f32::total_cmp`
+/// alone is unsuitable in either domain: it places a positive NaN above every
+/// finite value, so a NaN score -- reachable here because a non-finite stored
+/// vector yields a NaN distance and [`convert_distance_to_score`] passes NaN
+/// through -- would outrank real neighbours. Both NaN signs lose, and two NaNs
+/// compare equal so the caller's row-id tie-break decides between them.
+fn compare_scores(a: f32, b: f32) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => a.total_cmp(&b),
+    }
+}
+
+/// Allocate the label buffer for one native search, filled with [`SENTINEL`].
+///
+/// [`SENTINEL`] is the "no result" marker (the C ABI's `-1`), and
+/// [`collect_results`] drops any slot carrying it. Zero-filling the buffer
+/// instead makes that marker unreliable: `0` is a *legal* row id, so a slot the
+/// searcher leaves untouched is indistinguishable from a real hit, and it pairs
+/// with distance `0.0` -- the best distance both L2 and cosine can report -- so
+/// a search returning fewer neighbours than requested would surface row 0 as its
+/// top match. The FFI reports only a status code, never how many slots it wrote,
+/// so the Rust side cannot detect a short return; allocating the sentinel is
+/// correct either way.
+fn new_label_buffer(len: usize) -> Vec<u64> {
+    vec![SENTINEL; len]
+}
+
 /// Post-filter search results to top_k.
 fn collect_results(
     labels: &[u64],
@@ -66,21 +99,18 @@ fn collect_results(
     impl Ord for ScoredRow {
         // Reversed on score so the heap top is the weakest candidate; among
         // equal scores the larger row id sorts first and is therefore evicted
-        // first. Mirrors `vector_search::ScoredRow` so both backends keep the
-        // same rows for a tied score.
+        // first, which keeps the retained set independent of the order the
+        // searcher returned the pairs in. Same shape as
+        // `vector_search::ScoredRow`, except that scores are compared through
+        // `compare_scores` so a NaN cannot claim the strongest slot.
         fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            other
-                .score
-                .total_cmp(&self.score)
-                .then_with(|| self.row_id.cmp(&other.row_id))
+            compare_scores(other.score, self.score).then_with(|| self.row_id.cmp(&other.row_id))
         }
     }
 
     impl ScoredRow {
         fn is_stronger_than(&self, other: &Self) -> bool {
-            self.score
-                .total_cmp(&other.score)
-                .then_with(|| other.row_id.cmp(&self.row_id))
+            compare_scores(self.score, other.score).then_with(|| other.row_id.cmp(&self.row_id))
                 == std::cmp::Ordering::Greater
         }
     }
@@ -290,7 +320,7 @@ fn search_lumina(
         }
         let ek = std::cmp::min(effective_k, filter_id_list.len());
         let mut distances = vec![0.0f32; ek];
-        let mut labels = vec![0u64; ek];
+        let mut labels = new_label_buffer(ek);
         let mut search_opts: HashMap<String, String> = search_options_base.clone();
         search_opts.insert("search.thread_safe_filter".to_string(), "true".to_string());
         ensure_search_list_size(&mut search_opts, ek);
@@ -306,7 +336,7 @@ fn search_lumina(
         (distances, labels)
     } else {
         let mut distances = vec![0.0f32; effective_k];
-        let mut labels = vec![0u64; effective_k];
+        let mut labels = new_label_buffer(effective_k);
         let mut search_opts: HashMap<String, String> = search_options_base.clone();
         ensure_search_list_size(&mut search_opts, effective_k);
         searcher.search(
@@ -389,7 +419,7 @@ fn search_lumina_batch(
     }
 
     let mut distances = vec![0.0f32; vector_searches.len() * effective_k];
-    let mut labels = vec![0u64; vector_searches.len() * effective_k];
+    let mut labels = new_label_buffer(vector_searches.len() * effective_k);
     let mut search_opts: HashMap<String, String> = search_options_base.clone();
     ensure_search_list_size(&mut search_opts, effective_k);
     searcher.search(
@@ -583,37 +613,61 @@ mod tests {
         assert_eq!(shuffled_ids, vec![1, 2, 3]);
     }
 
-    /// A NaN distance must not make the comparison inconsistent. `total_cmp` is
-    /// a total order, which is the same treatment `vector_search` gives it, so
-    /// the selection stays independent of the order the searcher returned the
-    /// pairs in. Both arrays are permuted together so the pairing is preserved.
+    /// A NaN score must never outrank a finite one. `f32::total_cmp` alone ranks
+    /// a positive NaN above every finite value, so using it here would let a NaN
+    /// score -- which a non-finite stored vector can produce -- take the only
+    /// top-1 slot. Both NaN signs must lose, in either arrival order.
     #[test]
-    fn test_collect_results_with_nan_is_order_independent() {
-        let forward = collect_results(
-            &[7, 8, 9],
-            &[f32::NAN, 0.5, 0.5],
-            2,
-            LuminaVectorMetric::InnerProduct,
-        );
-        let reversed = collect_results(
-            &[9, 8, 7],
-            &[0.5, 0.5, f32::NAN],
-            2,
-            LuminaVectorMetric::InnerProduct,
-        );
+    fn test_collect_results_ranks_nan_below_finite_scores() {
+        for (labels, distances) in [
+            (vec![7u64, 8], vec![f32::NAN, 0.5]),
+            (vec![8u64, 7], vec![0.5, f32::NAN]),
+            (vec![7u64, 8], vec![-f32::NAN, 0.5]),
+            (vec![8u64, 7], vec![0.5, -f32::NAN]),
+        ] {
+            let result = collect_results(&labels, &distances, 1, LuminaVectorMetric::InnerProduct);
+            assert_eq!(result.len(), 1);
+            assert!(
+                result.contains_key(&8),
+                "the finite score must win regardless of arrival order, got {result:?}"
+            );
+        }
+    }
 
-        let mut forward_ids: Vec<u64> = forward.keys().copied().collect();
-        forward_ids.sort_unstable();
-        let mut reversed_ids: Vec<u64> = reversed.keys().copied().collect();
-        reversed_ids.sort_unstable();
+    /// The label buffer handed to the native searcher must start out as
+    /// [`SENTINEL`], never zero -- row id `0` is a legal result.
+    #[test]
+    fn test_new_label_buffer_is_sentinel_filled() {
+        assert_eq!(new_label_buffer(3), vec![SENTINEL; 3]);
+        assert!(new_label_buffer(0).is_empty());
+    }
+
+    /// A search that returns fewer neighbours than requested leaves the tail of
+    /// the buffer exactly as it was allocated. Those slots must not surface as
+    /// rows: with a zero-filled buffer the tail reads as row `0` at distance
+    /// `0.0`, and `1.0 / (1.0 + 0.0)` is the highest score L2 can produce, so
+    /// row 0 would be reported as the best match for every short result.
+    #[test]
+    fn test_unfilled_label_slots_are_not_reported_as_hits() {
+        let mut labels = new_label_buffer(4);
+        let mut distances = vec![0.0f32; 4];
+        labels[0] = 11;
+        distances[0] = 3.0;
+        labels[1] = 22;
+        distances[1] = 7.0;
+
+        let result = collect_results(&labels, &distances, 4, LuminaVectorMetric::L2);
 
         assert_eq!(
-            forward_ids, reversed_ids,
-            "a NaN score must not make the result depend on the input order"
+            result.len(),
+            2,
+            "only the slots the searcher filled may be reported, got {result:?}"
         );
-        // total_cmp ranks a positive NaN above every real score, so row 7 is
-        // retained and the 0.5 tie is settled by the smaller row id.
-        assert_eq!(forward_ids, vec![7, 8]);
+        assert!(result.contains_key(&11) && result.contains_key(&22));
+        assert!(
+            !result.contains_key(&0),
+            "an untouched slot must not become row 0"
+        );
     }
 
     #[test]
