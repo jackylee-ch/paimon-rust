@@ -700,6 +700,8 @@ impl TableCommit {
     /// files or storage errors are ignored so abort cleanup never masks the
     /// original write failure.
     pub async fn abort(&self, commit_messages: &[CommitMessage]) -> Result<()> {
+        CoreOptions::new(self.table.schema().options())
+            .ensure_type_paimon_served(&self.table.identifier().full_name())?;
         self.table.ensure_not_branch_reference_for_write()?;
 
         for message in commit_messages {
@@ -2870,7 +2872,7 @@ impl TableCommit {
                         msg.bucket,
                         msg.total_buckets.unwrap_or(self.total_buckets),
                         file.clone(),
-                        0,
+                        2,
                     )
                 })
             })
@@ -3135,6 +3137,13 @@ fn rand_f64() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn abort_still_cleans_up_for_a_query_auth_table() {
+        let table = crate::table::query_auth_table();
+        let commit = crate::table::WriteBuilder::new(&table).new_commit();
+        commit.abort(&[]).await.unwrap();
+    }
     use crate::catalog::Identifier;
     use crate::io::FileIOBuilder;
     use crate::spec::stats::BinaryTableStats;
@@ -3142,6 +3151,7 @@ mod tests {
         BinaryRowBuilder, DataFileMeta, DeletionVectorMeta, GlobalIndexMeta, IndexFileMeta,
         ManifestList, TableSchema, POSTPONE_BUCKET,
     };
+    use apache_avro::types::Value;
     use chrono::{DateTime, Utc};
 
     #[tokio::test]
@@ -3264,6 +3274,7 @@ mod tests {
             external_path: None,
             file_source: None,
             value_stats_cols: None,
+            column_max_sequence_numbers: None,
         }
     }
 
@@ -5366,6 +5377,45 @@ mod tests {
         assert_eq!(snapshot.changelog_record_count(), Some(3));
         assert!(snapshot.changelog_manifest_list().is_some());
         assert!(snapshot.changelog_manifest_list_size().unwrap() > 0);
+
+        let manifest_dir = format!("{table_path}/manifest");
+        let changelog_manifest_list = snapshot.changelog_manifest_list().unwrap();
+        let changelog_metas = ManifestList::read(
+            &file_io,
+            &format!("{manifest_dir}/{changelog_manifest_list}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(changelog_metas.len(), 1);
+
+        let manifest_bytes = file_io
+            .new_input(&format!(
+                "{manifest_dir}/{}",
+                changelog_metas[0].file_name()
+            ))
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let values = apache_avro::Reader::new(manifest_bytes.as_ref())
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(values.len(), 1);
+
+        let value = match &values[0] {
+            Value::Union(_, value) => value.as_ref(),
+            value => value,
+        };
+        let Value::Record(fields) = value else {
+            panic!("manifest entry must be an Avro record");
+        };
+        let version = fields
+            .iter()
+            .find(|(name, _)| name == "_VERSION")
+            .map(|(_, value)| value)
+            .expect("manifest entry format identifier");
+        assert_eq!(version, &Value::Int(2));
     }
 
     #[tokio::test]

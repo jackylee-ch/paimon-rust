@@ -870,9 +870,22 @@ pub fn extract_datum_from_arrow(
     col_idx: usize,
     data_type: &DataType,
 ) -> crate::Result<Option<Datum>> {
+    extract_datum_from_array(batch.column(col_idx), row_idx, col_idx, data_type)
+}
+
+/// Extract a scalar [`Datum`] from an Arrow array.
+///
+/// This is the column-level counterpart of [`extract_datum_from_arrow`], used
+/// when a nested list's child values need the same Paimon logical decoding as
+/// a top-level record-batch column.
+pub(crate) fn extract_datum_from_array(
+    col: &std::sync::Arc<dyn arrow_array::Array>,
+    row_idx: usize,
+    col_idx: usize,
+    data_type: &DataType,
+) -> crate::Result<Option<Datum>> {
     use arrow_array::Array;
 
-    let col = batch.column(col_idx);
     if col.is_null(row_idx) {
         return Ok(None);
     }
@@ -944,6 +957,13 @@ pub fn extract_datum_from_arrow(
                 .downcast_ref::<arrow_array::Date32Array>()
                 .ok_or_else(|| type_mismatch_err("Date", col_idx))?;
             Datum::Date(arr.value(row_idx))
+        }
+        DataType::Time(_) => {
+            let arr = col
+                .as_any()
+                .downcast_ref::<arrow_array::Time32MillisecondArray>()
+                .ok_or_else(|| type_mismatch_err("Time", col_idx))?;
+            Datum::Time(arr.value(row_idx))
         }
         DataType::Decimal(d) => {
             let arr = col

@@ -189,7 +189,7 @@ getrandom@0.3.4		X										X
 getrandom@0.4.3		X										X							
 glob@0.3.3		X										X							
 gloo-timers@0.3.0		X										X							
-h2@0.4.15												X							
+h2@0.4.16												X							
 half@2.7.1		X										X							
 hashbrown@0.14.5		X										X							
 hashbrown@0.15.5		X										X							
@@ -327,7 +327,7 @@ paimon@0.4.0		X
 paimon-datafusion@0.4.0		X																	
 paimon-ftindex-core@0.1.0		X																	
 paimon-mosaic-core@0.2.0		X																	
-paimon-vindex-core@0.3.0		X																	
+paimon-vindex-core@0.4.0		X																	
 parking_lot@0.12.5		X										X							
 parking_lot_core@0.9.12		X										X							
 parquet@58.3.0		X																	

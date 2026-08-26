@@ -1101,6 +1101,7 @@ impl<'a> PaimonTableScan<'a> {
                 Some(&mut trace),
             )
             .await?;
+        trace.planned_data_file_bytes = plan.planned_data_file_bytes();
         Ok((plan, trace))
     }
 
@@ -2173,6 +2174,7 @@ mod tests {
             external_path: None,
             file_source: None,
             value_stats_cols: None,
+            column_max_sequence_numbers: None,
         }
     }
 
@@ -2555,6 +2557,7 @@ mod tests {
             external_path: None,
             file_source: None,
             value_stats_cols: None,
+            column_max_sequence_numbers: None,
         }
     }
 

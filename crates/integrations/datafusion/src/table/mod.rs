@@ -113,14 +113,16 @@ impl PaimonTableProvider {
     ///
     /// Loads the table schema and converts it to Arrow for DataFusion.
     pub fn try_new(table: Table) -> DFResult<Self> {
-        let table_definition = build_table_definition(&table)?;
-        Self::try_new_with_table_definition(table, Some(table_definition))
+        let table_definition = build_table_definition(&table).ok();
+        Self::try_new_with_table_definition(table, table_definition)
     }
 
     fn try_new_with_table_definition(
         table: Table,
         table_definition: Option<String>,
     ) -> DFResult<Self> {
+        let identifier = table.identifier().clone();
+        crate::table_loader::ensure_paimon_served(&table, &identifier)?;
         let fields = datafusion_read_fields(&table);
         let schema = datafusion_arrow_schema(&fields, true)?;
         Ok(Self {
@@ -134,6 +136,8 @@ impl PaimonTableProvider {
         table: Table,
         blob_reader_registry: BlobReaderRegistry,
     ) -> DFResult<Self> {
+        let identifier = table.identifier().clone();
+        crate::table_loader::ensure_paimon_served(&table, &identifier)?;
         blob_reader_registry
             .register_if_absent(table.location().to_string(), table.file_io().clone());
         Self::try_new(table)
@@ -144,6 +148,8 @@ impl PaimonTableProvider {
         blob_reader_registry: BlobReaderRegistry,
         table_definition: Option<String>,
     ) -> DFResult<Self> {
+        let identifier = table.identifier().clone();
+        crate::table_loader::ensure_paimon_served(&table, &identifier)?;
         blob_reader_registry
             .register_if_absent(table.location().to_string(), table.file_io().clone());
         Self::try_new_with_table_definition(table, table_definition)

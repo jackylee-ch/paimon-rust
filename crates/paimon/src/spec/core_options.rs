@@ -17,6 +17,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::spec::TableType;
+
 const DELETION_VECTORS_ENABLED_OPTION: &str = "deletion-vectors.enabled";
 const DELETION_VECTORS_MERGE_ON_READ_OPTION: &str = "deletion-vectors.merge-on-read";
 pub(crate) const QUERY_AUTH_ENABLED_OPTION: &str = "query-auth.enabled";
@@ -28,8 +30,10 @@ const VECTOR_INDEX_SEARCH_MODE_OPTION: &str = "vector-index.search-mode";
 const FULL_TEXT_INDEX_SEARCH_MODE_OPTION: &str = "full-text-index.search-mode";
 const GLOBAL_INDEX_ROW_COUNT_PER_SHARD_OPTION: &str = "global-index.row-count-per-shard";
 const GLOBAL_INDEX_THREAD_NUM_OPTION: &str = "global-index.thread-num";
+const GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION: &str = "global-index.vindex.read-thread-num";
 const GLOBAL_INDEX_COLUMN_UPDATE_ACTION_OPTION: &str = "global-index.column-update-action";
 const SORTED_INDEX_RECORDS_PER_RANGE_OPTION: &str = "sorted-index.records-per-range";
+const BTREE_INDEX_RECORDS_PER_RANGE_OPTION: &str = "btree-index.records-per-range";
 const BTREE_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "btree-index.fallback-scan-max-size";
 const BITMAP_INDEX_FALLBACK_SCAN_MAX_SIZE_OPTION: &str = "bitmap-index.fallback-scan-max-size";
 const SOURCE_SPLIT_TARGET_SIZE_OPTION: &str = "source.split.target-size";
@@ -71,7 +75,7 @@ const STATS_MODE_SUFFIX: &str = "stats-mode";
 const ROW_TRACKING_ENABLED_OPTION: &str = "row-tracking.enabled";
 const CLUSTERING_INCREMENTAL_OPTION: &str = "clustering.incremental";
 pub(crate) const TABLE_TYPE_OPTION: &str = "type";
-pub(crate) const FORMAT_TABLE_TYPE: &str = "format-table";
+
 pub(crate) const PATH_OPTION: &str = "path";
 const MANIFEST_COMPRESSION_OPTION: &str = "manifest.compression";
 const MANIFEST_TARGET_FILE_SIZE_OPTION: &str = "manifest.target-file-size";
@@ -133,6 +137,8 @@ const DYNAMIC_BUCKET_TARGET_ROW_NUM_OPTION: &str = "dynamic-bucket.target-row-nu
 const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
 const DEFAULT_GLOBAL_INDEX_THREAD_NUM: i64 = 32;
+pub(crate) const DEFAULT_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM: usize = 64;
+const MAX_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM: i64 = tokio::sync::Semaphore::MAX_PERMITS as i64;
 const MAX_GLOBAL_INDEX_THREAD_NUM: i64 = {
     let tokio_max = (usize::MAX >> 3) as u64;
     let i32_max = i32::MAX as u64;
@@ -513,10 +519,39 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
-    /// Fail closed when `query-auth.enabled` is set: this client can't enforce the row
-    /// filter / column masking, so refuse to read. Call at every read boundary (build,
-    /// plan, materialize) so no binding fast-path can bypass it.
+    /// Fail closed at every storage boundary (build, plan, materialize): refuses a
+    /// `query-auth.enabled` table — this client can't enforce its row filter / column
+    /// masking — and a table whose declared type needs an engine of its own, which
+    /// this client would misread as Paimon.
     pub fn ensure_read_authorized(&self) -> crate::Result<()> {
+        self.ensure_query_auth_absent()?;
+        let declared = self.table_type()?;
+        if declared.requires_table_engine() {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "a table declared '{declared}' cannot be served as a Paimon table"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Type-only half of [`Self::ensure_read_authorized`], for paths that must
+    /// not touch an engine-served table's storage but stay usable under
+    /// `query-auth` (e.g. best-effort cleanup).
+    pub(crate) fn ensure_type_paimon_served(&self, full_name: &str) -> crate::Result<()> {
+        let declared = self.table_type()?;
+        if declared.requires_table_engine() {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "table '{full_name}' is declared '{declared}' and cannot be served as a Paimon table"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_query_auth_absent(&self) -> crate::Result<()> {
         if self.query_auth_enabled() {
             return Err(crate::Error::Unsupported {
                 message: "reading a table with 'query-auth.enabled' = true is not supported: \
@@ -620,11 +655,17 @@ impl<'a> CoreOptions<'a> {
             .unwrap_or(false)
     }
 
+    /// The declared [`TableType`], defaulting to [`TableType::Table`].
+    /// Fails on a value this client does not know.
+    pub fn table_type(&self) -> crate::Result<TableType> {
+        match self.options.get(TABLE_TYPE_OPTION) {
+            Some(value) => value.parse(),
+            None => Ok(TableType::default()),
+        }
+    }
+
     pub fn is_format_table(&self) -> bool {
-        self.options
-            .get(TABLE_TYPE_OPTION)
-            .map(|value| value.eq_ignore_ascii_case(FORMAT_TABLE_TYPE))
-            .unwrap_or(false)
+        matches!(self.table_type(), Ok(TableType::FormatTable))
     }
 
     pub fn path(&self) -> Option<&str> {
@@ -696,13 +737,15 @@ impl<'a> CoreOptions<'a> {
         Ok(value)
     }
 
-    /// Maximum number of concurrent tasks for global-index I/O, mirroring Java
+    /// Maximum number of concurrent global-index search tasks, mirroring Java
     /// `CoreOptions.GLOBAL_INDEX_THREAD_NUM` (key `global-index.thread-num`,
     /// default 32). Used as the per-operation fan-out limit for sorted BTree and
     /// bitmap shard reads, global-index vector search, and primary-key vector
-    /// search. A value of `1` reproduces strict sequential execution. A
-    /// non-positive value, or one above [`MAX_GLOBAL_INDEX_THREAD_NUM`], is a
-    /// misconfiguration and fails loud rather than being silently clamped.
+    /// search. Vindex file range reads use
+    /// [`Self::global_index_vindex_read_thread_num`] instead. A value of `1`
+    /// makes these search tasks sequential, but does not serialize Vindex range
+    /// reads. A non-positive value, or one above [`MAX_GLOBAL_INDEX_THREAD_NUM`],
+    /// is a misconfiguration and fails loud rather than being silently clamped.
     pub fn global_index_thread_num(&self) -> crate::Result<usize> {
         let value = self
             .parse_i64_option(GLOBAL_INDEX_THREAD_NUM_OPTION)?
@@ -728,16 +771,51 @@ impl<'a> CoreOptions<'a> {
         Ok(value as usize)
     }
 
-    pub fn sorted_index_records_per_range(&self) -> crate::Result<i64> {
+    /// Maximum number of concurrent range reads shared by Vindex readers in one
+    /// search operation (key `global-index.vindex.read-thread-num`, default 64).
+    /// This is independent of [`Self::global_index_thread_num`].
+    pub fn global_index_vindex_read_thread_num(&self) -> crate::Result<usize> {
         let value = self
-            .parse_i64_option(SORTED_INDEX_RECORDS_PER_RANGE_OPTION)?
-            .unwrap_or(DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD);
+            .parse_i64_option(GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION)?
+            .unwrap_or(DEFAULT_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM as i64);
         if value <= 0 {
             return Err(crate::Error::DataInvalid {
                 message: format!(
                     "Option '{}' must be greater than 0, got: {}",
-                    SORTED_INDEX_RECORDS_PER_RANGE_OPTION, value
+                    GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION, value
                 ),
+                source: None,
+            });
+        }
+        if value > MAX_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM {
+            return Err(crate::Error::DataInvalid {
+                message: format!(
+                    "Option '{}' must not exceed {}, got: {}",
+                    GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION,
+                    MAX_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM,
+                    value
+                ),
+                source: None,
+            });
+        }
+        Ok(value as usize)
+    }
+
+    pub fn sorted_index_records_per_range(&self) -> crate::Result<i64> {
+        let option = if self
+            .options
+            .contains_key(SORTED_INDEX_RECORDS_PER_RANGE_OPTION)
+        {
+            SORTED_INDEX_RECORDS_PER_RANGE_OPTION
+        } else {
+            BTREE_INDEX_RECORDS_PER_RANGE_OPTION
+        };
+        let value = self
+            .parse_i64_option(option)?
+            .unwrap_or(DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD);
+        if value <= 0 {
+            return Err(crate::Error::DataInvalid {
+                message: format!("Option '{}' must be greater than 0, got: {}", option, value),
                 source: None,
             });
         }
@@ -876,6 +954,33 @@ impl<'a> CoreOptions<'a> {
     ///
     /// This is the semantic owner for selector mutual exclusion and strict
     /// numeric parsing.
+    /// Fails when these options forbid the read outright, or ask for
+    /// something a table engine cannot honor: a scan option this client does
+    /// not support, or a historical state. Dropping any of them would answer
+    /// with unfiltered or current data instead.
+    ///
+    /// Both the table's stored options and a session's options go through
+    /// here, so neither source can skip a check the other applies.
+    pub fn ensure_engine_can_serve(&self, full_name: &str) -> crate::Result<()> {
+        self.ensure_query_auth_absent()?;
+        self.validate_scan_options()?;
+        if self.has_time_travel_selector() {
+            return Err(crate::Error::Unsupported {
+                message: format!(
+                    "time travel is not supported for engine-served table '{full_name}'"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether these options ask for a historical state of the table. A
+    /// malformed selector counts too, so callers that cannot honor time
+    /// travel reject rather than answer from the current state.
+    pub fn has_time_travel_selector(&self) -> bool {
+        !matches!(self.try_time_travel_selector(), Ok(None))
+    }
+
     pub(crate) fn try_time_travel_selector(&self) -> crate::Result<Option<TimeTravelSelector<'a>>> {
         let selectors = self.configured_time_travel_selectors();
         if selectors.len() > 1 {
@@ -1521,6 +1626,10 @@ mod tests {
         );
         assert_eq!(core_options.global_index_thread_num().unwrap(), 32);
         assert_eq!(
+            core_options.global_index_vindex_read_thread_num().unwrap(),
+            64
+        );
+        assert_eq!(
             core_options.sorted_index_records_per_range().unwrap(),
             100_000
         );
@@ -1765,20 +1874,95 @@ mod tests {
     }
 
     #[test]
-    fn test_sorted_index_records_per_range_rejects_invalid_values() {
-        for value in ["0", "-1", "abc"] {
+    fn test_global_index_vindex_read_thread_num_default_and_custom() {
+        assert_eq!(
+            CoreOptions::new(&HashMap::new())
+                .global_index_vindex_read_thread_num()
+                .unwrap(),
+            64
+        );
+
+        for value in [32, 64] {
             let options = HashMap::from([(
-                SORTED_INDEX_RECORDS_PER_RANGE_OPTION.to_string(),
+                GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION.to_string(),
                 value.to_string(),
             )]);
-            let core = CoreOptions::new(&options);
-
-            let err = core
-                .sorted_index_records_per_range()
-                .expect_err("invalid records-per-range should fail");
-            assert!(matches!(err, crate::Error::DataInvalid { message, .. }
-                    if message.contains(SORTED_INDEX_RECORDS_PER_RANGE_OPTION)));
+            assert_eq!(
+                CoreOptions::new(&options)
+                    .global_index_vindex_read_thread_num()
+                    .unwrap(),
+                value
+            );
         }
+    }
+
+    #[test]
+    fn test_global_index_vindex_read_thread_num_rejects_invalid_values() {
+        for value in [
+            "0".to_string(),
+            "abc".to_string(),
+            (MAX_GLOBAL_INDEX_VINDEX_READ_THREAD_NUM + 1).to_string(),
+        ] {
+            let options = HashMap::from([(
+                GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION.to_string(),
+                value,
+            )]);
+            let err = CoreOptions::new(&options)
+                .global_index_vindex_read_thread_num()
+                .expect_err("invalid vindex.read-thread-num should fail");
+            assert!(matches!(err, crate::Error::DataInvalid { message, .. }
+                    if message.contains(GLOBAL_INDEX_VINDEX_READ_THREAD_NUM_OPTION)));
+        }
+    }
+
+    #[test]
+    fn test_sorted_index_records_per_range_rejects_invalid_values() {
+        for option in [
+            SORTED_INDEX_RECORDS_PER_RANGE_OPTION,
+            BTREE_INDEX_RECORDS_PER_RANGE_OPTION,
+        ] {
+            for value in ["0", "-1", "abc"] {
+                let options = HashMap::from([(option.to_string(), value.to_string())]);
+                let core = CoreOptions::new(&options);
+
+                let err = core
+                    .sorted_index_records_per_range()
+                    .expect_err("invalid records-per-range should fail");
+                assert!(matches!(err, crate::Error::DataInvalid { message, .. }
+                        if message.contains(option)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_sorted_index_records_per_range_prefers_primary_over_fallback() {
+        let options = HashMap::from([
+            (
+                SORTED_INDEX_RECORDS_PER_RANGE_OPTION.to_string(),
+                "20".to_string(),
+            ),
+            (
+                BTREE_INDEX_RECORDS_PER_RANGE_OPTION.to_string(),
+                "10".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            CoreOptions::new(&options)
+                .sorted_index_records_per_range()
+                .unwrap(),
+            20
+        );
+
+        let fallback = HashMap::from([(
+            BTREE_INDEX_RECORDS_PER_RANGE_OPTION.to_string(),
+            "10".to_string(),
+        )]);
+        assert_eq!(
+            CoreOptions::new(&fallback)
+                .sorted_index_records_per_range()
+                .unwrap(),
+            10
+        );
     }
 
     #[test]

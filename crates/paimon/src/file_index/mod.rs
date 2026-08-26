@@ -15,5 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Bloom reader/writer and predicate plumbing stay crate-private until the
+// factory, data-writer, and scan integration land in later changes.
+#[allow(dead_code)]
+pub(crate) mod bloom_filter;
 mod file_index_format;
+#[allow(dead_code)]
+pub(crate) mod file_index_predicate;
+#[allow(dead_code)]
+pub(crate) mod file_index_reader;
+#[allow(dead_code)]
+pub(crate) mod file_index_result;
+
 pub use file_index_format::*;

@@ -80,12 +80,68 @@ pub(crate) fn avro_codec(compression: &str) -> crate::Result<Codec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::avro::from_avro_bytes_fast;
     use crate::spec::manifest_common::FileKind;
     use crate::spec::manifest_entry::{ManifestEntry, MANIFEST_ENTRY_SCHEMA};
     use crate::spec::manifest_file_meta::MANIFEST_FILE_META_SCHEMA;
     use crate::spec::stats::BinaryTableStats;
     use crate::spec::{DataFileMeta, ManifestFileMeta};
     use chrono::{DateTime, Utc};
+
+    fn manifest_entry() -> ManifestEntry {
+        manifest_entry_with_sequences(None)
+    }
+
+    fn manifest_entry_with_sequences(
+        column_max_sequence_numbers: Option<Vec<i64>>,
+    ) -> ManifestEntry {
+        let value_bytes = vec![
+            0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 49, 0, 0, 0, 0, 0, 0, 129, 1, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let single_value = vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+        ManifestEntry::new(
+            FileKind::Add,
+            single_value.clone(),
+            1,
+            10,
+            DataFileMeta {
+                file_name: "test.parquet".to_string(),
+                file_size: 100,
+                row_count: 50,
+                min_key: single_value.clone(),
+                max_key: single_value,
+                key_stats: BinaryTableStats::new(
+                    value_bytes.clone(),
+                    value_bytes.clone(),
+                    vec![Some(1), Some(2)],
+                ),
+                value_stats: BinaryTableStats::new(
+                    value_bytes.clone(),
+                    value_bytes,
+                    vec![Some(1), Some(2)],
+                ),
+                min_sequence_number: 1,
+                max_sequence_number: 50,
+                schema_id: 0,
+                level: 0,
+                extra_files: vec![],
+                creation_time: Some(
+                    "2024-09-06T07:45:55.039+00:00"
+                        .parse::<DateTime<Utc>>()
+                        .unwrap(),
+                ),
+                delete_row_count: Some(0),
+                embedded_index: None,
+                first_row_id: None,
+                write_cols: None,
+                external_path: None,
+                file_source: None,
+                value_stats_cols: None,
+                column_max_sequence_numbers,
+            },
+            2,
+        )
+    }
 
     #[test]
     fn test_roundtrip_manifest_file_meta() {
@@ -134,53 +190,96 @@ mod tests {
 
     #[test]
     fn test_roundtrip_manifest_entry() {
-        let value_bytes = vec![
-            0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 49, 0, 0, 0, 0, 0, 0, 129, 1, 0, 0, 0, 0, 0, 0, 0,
-        ];
-        let single_value = vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
-        let original = vec![ManifestEntry::new(
-            FileKind::Add,
-            single_value.clone(),
-            1,
-            10,
-            DataFileMeta {
-                file_name: "test.parquet".to_string(),
-                file_size: 100,
-                row_count: 50,
-                min_key: single_value.clone(),
-                max_key: single_value.clone(),
-                key_stats: BinaryTableStats::new(
-                    value_bytes.clone(),
-                    value_bytes.clone(),
-                    vec![Some(1), Some(2)],
-                ),
-                value_stats: BinaryTableStats::new(
-                    value_bytes.clone(),
-                    value_bytes.clone(),
-                    vec![Some(1), Some(2)],
-                ),
-                min_sequence_number: 1,
-                max_sequence_number: 50,
-                schema_id: 0,
-                level: 0,
-                extra_files: vec![],
-                creation_time: Some(
-                    "2024-09-06T07:45:55.039+00:00"
-                        .parse::<DateTime<Utc>>()
-                        .unwrap(),
-                ),
-                delete_row_count: Some(0),
-                embedded_index: None,
-                first_row_id: None,
-                write_cols: None,
-                external_path: None,
-                file_source: None,
-                value_stats_cols: None,
-            },
-            2,
-        )];
+        let original = vec![manifest_entry()];
         let bytes = to_avro_bytes(MANIFEST_ENTRY_SCHEMA, &original).unwrap();
         let decoded = from_avro_bytes::<ManifestEntry>(&bytes).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    /// The Avro manifest record carries `_WRITE_COLS_SEQUENCES`, so a populated value must
+    /// survive a write/read round trip rather than being dropped on either side.
+    #[test]
+    fn test_roundtrip_manifest_entry_with_column_max_sequence_numbers() {
+        for value in [Some(vec![15, 100, 150, 200]), Some(Vec::new()), None] {
+            let original = vec![manifest_entry_with_sequences(value.clone())];
+            let bytes = to_avro_bytes(MANIFEST_ENTRY_SCHEMA, &original).unwrap();
+
+            let decoded = from_avro_bytes::<ManifestEntry>(&bytes).unwrap();
+            assert_eq!(decoded, original);
+            assert_eq!(decoded[0].file().column_max_sequence_numbers, value);
+
+            // The hand-written decoder reads the same bytes by field name.
+            let fast = from_avro_bytes_fast::<ManifestEntry>(&bytes).unwrap();
+            assert_eq!(fast, original);
+            assert_eq!(fast[0].file().column_max_sequence_numbers, value);
+        }
+    }
+
+    /// A writer that predates the field omits it entirely; it must read back as absent.
+    #[test]
+    fn test_read_manifest_entry_without_column_max_sequence_numbers_field() {
+        let mut schema: serde_json::Value = serde_json::from_str(MANIFEST_ENTRY_SCHEMA).unwrap();
+        let fields = schema.as_array_mut().unwrap()[1]
+            .as_object_mut()
+            .unwrap()
+            .get_mut("fields")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        let file_fields = fields
+            .iter_mut()
+            .find(|field| field.get("name").and_then(|name| name.as_str()) == Some("_FILE"))
+            .unwrap()
+            .get_mut("type")
+            .unwrap()
+            .get_mut("fields")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        let before = file_fields.len();
+        file_fields.retain(|field| {
+            field.get("name").and_then(|name| name.as_str()) != Some("_WRITE_COLS_SEQUENCES")
+        });
+        assert_eq!(
+            file_fields.len(),
+            before - 1,
+            "field must exist to be removed"
+        );
+        let legacy_schema = serde_json::to_string(&schema).unwrap();
+
+        let original = vec![manifest_entry()];
+        let bytes = to_avro_bytes(&legacy_schema, &original).unwrap();
+        let decoded = from_avro_bytes_fast::<ManifestEntry>(&bytes).unwrap();
+        assert_eq!(decoded[0].file().column_max_sequence_numbers, None);
+    }
+
+    #[test]
+    fn test_read_manifest_entry_with_legacy_rust_schema() {
+        let mut schema: serde_json::Value = serde_json::from_str(MANIFEST_ENTRY_SCHEMA).unwrap();
+        let fields = schema.as_array_mut().unwrap()[1]
+            .as_object_mut()
+            .unwrap()
+            .get_mut("fields")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        let file = fields
+            .iter_mut()
+            .find(|field| field.get("name").and_then(|name| name.as_str()) == Some("_FILE"))
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        let file_type = file.remove("type").unwrap();
+        file.insert("type".to_string(), serde_json::json!(["null", file_type]));
+        file.insert("default".to_string(), serde_json::Value::Null);
+
+        let version = fields.remove(0);
+        fields.push(version);
+        let legacy_schema = serde_json::to_string(&schema).unwrap();
+
+        let original = vec![manifest_entry()];
+        let bytes = to_avro_bytes(&legacy_schema, &original).unwrap();
+        let decoded = from_avro_bytes_fast::<ManifestEntry>(&bytes).unwrap();
         assert_eq!(original, decoded);
     }
 
@@ -280,6 +379,7 @@ mod tests {
                         external_path: None,
                         file_source: None,
                         value_stats_cols: None,
+                        column_max_sequence_numbers: None,
                     },
                     2
                 ),
@@ -321,6 +421,7 @@ mod tests {
                         external_path: None,
                         file_source: None,
                         value_stats_cols: None,
+                        column_max_sequence_numbers: None,
                     },
                     2
                 ),

@@ -20,10 +20,11 @@
 pub(crate) mod aggregator;
 mod audit_log_table;
 pub(crate) mod bin_pack;
+mod bitmap_global_index_format;
 mod bitmap_global_index_reader;
+mod bitmap_global_index_writer;
 mod blob_resolver;
 mod branch_manager;
-mod btree_global_index_build_builder;
 mod bucket_assigner;
 mod bucket_assigner_constant;
 mod bucket_assigner_cross;
@@ -88,6 +89,8 @@ pub(crate) mod schema_manager;
 pub(crate) mod snapshot_commit;
 mod snapshot_manager;
 mod sort_merge;
+mod sorted_global_index_build_builder;
+mod sorted_global_index_options;
 mod source;
 mod stats_filter;
 pub(crate) mod table_commit;
@@ -105,7 +108,6 @@ use crate::Result;
 use arrow_array::RecordBatch;
 pub use audit_log_table::AuditLogTable;
 pub use branch_manager::BranchManager;
-pub use btree_global_index_build_builder::BTreeGlobalIndexBuildBuilder;
 pub use commit_message::CommitMessage;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::{DataEvolutionDeleteWriter, DataEvolutionWriter};
@@ -135,6 +137,9 @@ pub use scan_trace::ScanTrace;
 pub use schema_manager::SchemaManager;
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;
+pub use sorted_global_index_build_builder::{
+    BTreeGlobalIndexBuildBuilder, SortedGlobalIndexBuildBuilder,
+};
 pub use source::{
     merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
@@ -349,8 +354,12 @@ impl Table {
         LuminaIndexBuildBuilder::new(self)
     }
 
+    pub fn new_sorted_global_index_build_builder(&self) -> SortedGlobalIndexBuildBuilder<'_> {
+        SortedGlobalIndexBuildBuilder::new(self)
+    }
+
     pub fn new_btree_global_index_build_builder(&self) -> BTreeGlobalIndexBuildBuilder<'_> {
-        BTreeGlobalIndexBuildBuilder::new(self)
+        self.new_sorted_global_index_build_builder()
     }
 
     pub fn new_global_index_drop_builder(&self) -> GlobalIndexDropBuilder<'_> {
@@ -425,19 +434,45 @@ impl Table {
     /// schema (the `if let Ok` below swallows them); an invalid selector
     /// still fails later at scan planning.
     pub async fn copy_with_time_travel(&self, extra: HashMap<String, String>) -> Result<Self> {
+        self.copy_with_time_travel_mode(extra, false).await
+    }
+
+    /// Like [`Self::copy_with_time_travel`], but propagates selector resolution
+    /// failures. Services should use this variant so a missing or unreadable
+    /// snapshot cannot silently fall back to the current schema.
+    pub async fn copy_with_time_travel_strict(
+        &self,
+        extra: HashMap<String, String>,
+    ) -> Result<Self> {
+        self.copy_with_time_travel_mode(extra, true).await
+    }
+
+    async fn copy_with_time_travel_mode(
+        &self,
+        extra: HashMap<String, String>,
+        strict: bool,
+    ) -> Result<Self> {
+        // Resolution reads Paimon snapshot paths, so refuse before any IO.
+        CoreOptions::new(self.schema.options())
+            .ensure_type_paimon_served(&self.identifier.full_name())?;
         let mut table = self.copy_with_options(extra);
         // Reject unimplemented scan options on the merged view before any IO, so
         // both table-level and per-read options are covered.
         CoreOptions::new(table.schema().options()).validate_scan_options()?;
         // travel_to_snapshot returns Ok(None) without IO when the merged
         // options contain no selector.
-        if let Ok(Some(snapshot)) = time_travel::travel_to_snapshot(
+        let resolved = time_travel::travel_to_snapshot(
             &table.snapshot_manager(),
             &table.tag_manager(),
             table.schema.options(),
         )
-        .await
-        {
+        .await;
+        let snapshot = if strict {
+            resolved?
+        } else {
+            resolved.ok().flatten()
+        };
+        if let Some(snapshot) = snapshot {
             if snapshot.schema_id() != table.schema.id() {
                 let snapshot_schema = table.schema_manager.schema(snapshot.schema_id()).await?;
                 table.schema =
@@ -450,6 +485,10 @@ impl Table {
     }
 
     pub async fn copy_with_branch(&self, branch_name: &str) -> Result<Self> {
+        // The branch schema replaces this one wholesale and could drop the
+        // declared type, so refuse before any branch I/O.
+        CoreOptions::new(self.schema.options())
+            .ensure_type_paimon_served(&self.identifier.full_name())?;
         let branch = if branch_name.trim().is_empty() {
             return Err(crate::Error::DataInvalid {
                 message: "Branch name cannot be empty.".to_string(),
