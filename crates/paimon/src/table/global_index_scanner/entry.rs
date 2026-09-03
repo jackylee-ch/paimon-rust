@@ -19,7 +19,9 @@
 
 use crate::btree::BTreeIndexMeta;
 use crate::spec::{DataType, PredicateOperator};
-use crate::table::bitmap_global_index_format::is_bitmap_floating_residual_sensitive_op;
+use crate::table::bitmap_global_index_format::{
+    is_bitmap_floating_residual_sensitive_op, opposite_zero_key,
+};
 use crate::table::index_file_path::IndexFileLocation;
 use crate::{Error, Result};
 use std::cmp::Ordering;
@@ -169,10 +171,21 @@ pub(super) fn bitmap_meta_may_match(
     cmp: &dyn Fn(&[u8], &[u8]) -> Ordering,
 ) -> bool {
     if is_floating_point(data_type) && is_bitmap_floating_residual_sensitive_op(op) {
-        !meta.only_nulls()
-    } else {
-        meta.may_match(op, serialized_literals, cmp)
+        return !meta.only_nulls();
     }
+    if meta.may_match(op, serialized_literals, cmp) {
+        return true;
+    }
+    // A `±0.0` literal also matches rows holding the other signed zero, but the
+    // comparator orders `-0.0` below `+0.0`, so a key range that stops at one of
+    // them would prune a file the reader would have found. `Eq` looks at the first
+    // literal only, so the alternates are probed as a call of their own rather
+    // than appended.
+    let alternate_zeros: Vec<Vec<u8>> = serialized_literals
+        .iter()
+        .filter_map(|literal| opposite_zero_key(literal, data_type))
+        .collect();
+    !alternate_zeros.is_empty() && meta.may_match(op, &alternate_zeros, cmp)
 }
 
 pub(super) fn bitmap_meta_may_match_between(
@@ -219,5 +232,99 @@ impl GlobalIndexFileKind {
             Self::Multivalue => "multivalue",
             Self::FM => "FM",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{Datum, DoubleType, FloatType};
+    use crate::table::bitmap_global_index_format::{
+        make_bitmap_key_comparator, serialize_bitmap_datum,
+    };
+
+    /// A file whose key range stops at one signed zero must still be visited when
+    /// the predicate names the other: the comparator orders `-0.0` below `+0.0`, so
+    /// the plain min/max check prunes a file the reader would have matched.
+    fn assert_signed_zero_survives_meta_prune(
+        data_type: DataType,
+        negative_zero: Datum,
+        positive_zero: Datum,
+        one: Datum,
+    ) {
+        let cmp = make_bitmap_key_comparator(&data_type);
+        let negative_zero_key = serialize_bitmap_datum(&negative_zero, &data_type);
+        let positive_zero_key = serialize_bitmap_datum(&positive_zero, &data_type);
+        let one_key = serialize_bitmap_datum(&one, &data_type);
+
+        // Key range is exactly [-0.0, -0.0]; the literal is +0.0.
+        let meta = BTreeIndexMeta::new(
+            Some(negative_zero_key.clone()),
+            Some(negative_zero_key.clone()),
+            false,
+        );
+        for op in [PredicateOperator::Eq, PredicateOperator::In] {
+            assert!(
+                bitmap_meta_may_match(
+                    &meta,
+                    op,
+                    &data_type,
+                    std::slice::from_ref(&positive_zero_key),
+                    &cmp
+                ),
+                "{op} on +0.0 must not prune a -0.0-only file ({data_type:?})"
+            );
+        }
+        // In with a mix of literals.
+        assert!(bitmap_meta_may_match(
+            &meta,
+            PredicateOperator::In,
+            &data_type,
+            &[positive_zero_key.clone(), one_key.clone()],
+            &cmp
+        ));
+
+        // The other direction: range is [+0.0, +0.0], literal is -0.0.
+        let meta = BTreeIndexMeta::new(
+            Some(positive_zero_key.clone()),
+            Some(positive_zero_key.clone()),
+            false,
+        );
+        assert!(bitmap_meta_may_match(
+            &meta,
+            PredicateOperator::Eq,
+            &data_type,
+            std::slice::from_ref(&negative_zero_key),
+            &cmp
+        ));
+
+        // A file that holds neither zero is still pruned for a zero literal.
+        let meta = BTreeIndexMeta::new(Some(one_key.clone()), Some(one_key), false);
+        assert!(
+            !bitmap_meta_may_match(
+                &meta,
+                PredicateOperator::Eq,
+                &data_type,
+                &[positive_zero_key],
+                &cmp
+            ),
+            "pruning must still happen when no zero is in range ({data_type:?})"
+        );
+    }
+
+    #[test]
+    fn test_signed_zero_survives_meta_prune() {
+        assert_signed_zero_survives_meta_prune(
+            DataType::Float(FloatType::new()),
+            Datum::Float(-0.0),
+            Datum::Float(0.0),
+            Datum::Float(1.0),
+        );
+        assert_signed_zero_survives_meta_prune(
+            DataType::Double(DoubleType::new()),
+            Datum::Double(-0.0),
+            Datum::Double(0.0),
+            Datum::Double(1.0),
+        );
     }
 }

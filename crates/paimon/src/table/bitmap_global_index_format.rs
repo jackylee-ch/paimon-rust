@@ -74,6 +74,37 @@ pub(crate) fn serialize_bitmap_datum(datum: &Datum, data_type: &DataType) -> Vec
     }
 }
 
+/// The dictionary key for the other signed zero, when `key` encodes `+0.0` or
+/// `-0.0`; `None` for every other key and every non-floating type.
+///
+/// [`serialize_bitmap_datum`] keeps the sign bit, so the two zeros are distinct
+/// keys, and the comparator orders `-0.0` below `+0.0`. SQL treats them as equal,
+/// as does the local bitmap file index (`file_index::bitmap`'s `equivalent_zero`),
+/// so an equality lookup has to consult both keys.
+pub(crate) fn opposite_zero_key(key: &[u8], data_type: &DataType) -> Option<Vec<u8>> {
+    const F32_SIGN_BIT: u32 = 0x8000_0000;
+    const F64_SIGN_BIT: u64 = 0x8000_0000_0000_0000;
+    match data_type {
+        DataType::Float(_) => {
+            let flipped = match u32::from_le_bytes(key.try_into().ok()?) {
+                0 => F32_SIGN_BIT,
+                F32_SIGN_BIT => 0,
+                _ => return None,
+            };
+            Some(flipped.to_le_bytes().to_vec())
+        }
+        DataType::Double(_) => {
+            let flipped = match u64::from_le_bytes(key.try_into().ok()?) {
+                0 => F64_SIGN_BIT,
+                F64_SIGN_BIT => 0,
+                _ => return None,
+            };
+            Some(flipped.to_le_bytes().to_vec())
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn is_bitmap_floating_residual_sensitive_op(op: PredicateOperator) -> bool {
     matches!(
         op,

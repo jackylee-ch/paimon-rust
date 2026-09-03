@@ -21,7 +21,8 @@
 
 use super::bitmap_global_index_format::{
     block_info, is_bitmap_floating_residual_sensitive_op, make_bitmap_key_comparator,
-    serialize_bitmap_datum, BlockInfo, BLOCK_TRAILER_LENGTH, FOOTER_LENGTH, MAGIC, VERSION,
+    opposite_zero_key, serialize_bitmap_datum, BlockInfo, BLOCK_TRAILER_LENGTH, FOOTER_LENGTH,
+    MAGIC, VERSION,
 };
 #[cfg(test)]
 use super::bitmap_global_index_writer::BitmapGlobalIndexWriter;
@@ -270,9 +271,19 @@ impl BitmapGlobalIndexReader {
         self.read_bitmap(self.footer.non_null_rows_block).await
     }
 
+    /// Equality over one key, plus the other signed zero when the key is `±0.0`
+    /// -- the two are separate dictionary entries but compare equal in SQL.
     async fn equal(&self, key: &[u8], data_type: &DataType) -> io::Result<RoaringTreemap> {
         let logical_cmp = make_bitmap_key_comparator(data_type);
-        self.equal_with_comparator(key, logical_cmp.as_ref()).await
+        let mut result = self
+            .equal_with_comparator(key, logical_cmp.as_ref())
+            .await?;
+        if let Some(other_zero) = opposite_zero_key(key, data_type) {
+            result |= self
+                .equal_with_comparator(&other_zero, logical_cmp.as_ref())
+                .await?;
+        }
+        Ok(result)
     }
 
     async fn equal_with_comparator(
@@ -288,6 +299,10 @@ impl BitmapGlobalIndexReader {
 
     async fn in_keys(&self, keys: &[Vec<u8>], data_type: &DataType) -> io::Result<RoaringTreemap> {
         let mut sorted_keys = keys.to_vec();
+        sorted_keys.extend(
+            keys.iter()
+                .filter_map(|key| opposite_zero_key(key, data_type)),
+        );
         sorted_keys.sort();
         sorted_keys.dedup();
 
@@ -1042,6 +1057,90 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `-0.0` and `+0.0` are two distinct dictionary keys ordered apart by
+    /// `total_cmp`, so an equality lookup that consults only the literal's own key
+    /// reports an empty candidate set for rows holding the other zero. SQL treats
+    /// them as equal, and so does the local bitmap file index
+    /// (`file_index::bitmap`'s `equivalent_zero`, pinned by its Java-golden test).
+    async fn assert_signed_zeros_match_each_other(
+        data_type: DataType,
+        negative_zero: Datum,
+        positive_zero: Datum,
+        one: Datum,
+    ) {
+        // Dictionary holds -0.0 only.
+        let (reader, _) =
+            write_and_read_entries(&data_type, &[(negative_zero.clone(), 7), (one.clone(), 9)])
+                .await;
+        for op in [PredicateOperator::Eq, PredicateOperator::ArrayContains] {
+            let rows = reader
+                .query(op, std::slice::from_ref(&positive_zero), &data_type)
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter().collect::<Vec<_>>(),
+                vec![7],
+                "{op} on +0.0 must match a -0.0 key ({data_type:?})"
+            );
+        }
+        let rows = reader
+            .query(
+                PredicateOperator::In,
+                &[positive_zero.clone(), one.clone()],
+                &data_type,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![7, 9]);
+
+        // Dictionary holds +0.0 only: the other direction must hold too.
+        let (reader, _) =
+            write_and_read_entries(&data_type, &[(positive_zero.clone(), 3), (one.clone(), 5)])
+                .await;
+        let rows = reader
+            .query(
+                PredicateOperator::Eq,
+                std::slice::from_ref(&negative_zero),
+                &data_type,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().collect::<Vec<_>>(),
+            vec![3],
+            "Eq on -0.0 must match a +0.0 key ({data_type:?})"
+        );
+
+        // A non-zero literal is unaffected.
+        let rows = reader
+            .query(
+                PredicateOperator::Eq,
+                std::slice::from_ref(&one),
+                &data_type,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![5]);
+    }
+
+    #[tokio::test]
+    async fn test_signed_zeros_match_each_other() {
+        assert_signed_zeros_match_each_other(
+            DataType::Float(FloatType::new()),
+            Datum::Float(-0.0),
+            Datum::Float(0.0),
+            Datum::Float(1.0),
+        )
+        .await;
+        assert_signed_zeros_match_each_other(
+            DataType::Double(DoubleType::new()),
+            Datum::Double(-0.0),
+            Datum::Double(0.0),
+            Datum::Double(1.0),
+        )
+        .await;
     }
 
     #[tokio::test]
