@@ -1072,9 +1072,10 @@ mod tests {
 
     /// `-0.0` and `+0.0` are two distinct dictionary keys ordered apart by
     /// `total_cmp`, so an equality lookup that consults only the literal's own key
-    /// reports an empty candidate set for rows holding the other zero. SQL treats
-    /// them as equal, and so does the local bitmap file index
-    /// (`file_index::bitmap`'s `equivalent_zero`, pinned by its Java-golden test).
+    /// reports an empty candidate set for rows holding the other zero. The scalar
+    /// row-level filter compares through Arrow's IEEE kernel, where the two are
+    /// equal, so the index must admit both or it drops rows the filter would keep.
+    /// The local bitmap file index already unions them in `equivalent_zero`.
     async fn assert_signed_zeros_match_each_other(
         data_type: DataType,
         negative_zero: Datum,
