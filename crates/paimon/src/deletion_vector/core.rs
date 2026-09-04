@@ -250,25 +250,91 @@ impl DeletionVector {
     /// deletes; a data file with more than `u32::MAX` rows would be needed to
     /// reach it.
     fn from_bitmap64_bytes(bitmap_data: &[u8]) -> crate::Result<Self> {
-        let treemap = roaring::RoaringTreemap::deserialize_from(bitmap_data).map_err(|e| {
-            crate::Error::DataInvalid {
-                message: format!("Failed to deserialize 64-bit RoaringBitmap: {e}"),
-                source: Some(Box::new(e)),
-            }
-        })?;
-        let mut bitmap = RoaringBitmap::new();
-        for position in treemap {
-            let position = u32::try_from(position).map_err(|_| crate::Error::DataInvalid {
-                message: format!(
-                    "Deletion vector position {position} exceeds u32::MAX, \
-                     which this reader cannot represent"
-                ),
+        // The outer layer is decoded here rather than through
+        // `RoaringTreemap::deserialize_from`, which validates each inner roaring32
+        // bitmap but inserts the bucket keys straight into a `BTreeMap` -- a
+        // duplicate key silently replaces the earlier bucket and its deletes are
+        // lost. Java's `OptimizedRoaringBitmap64.deserialize` rejects that, so the
+        // count and every key are checked the same way here
+        // (`readBitmapCount` / `readKey`).
+        let mut cursor = bitmap_data;
+        let bucket_count = read_u64_le(&mut cursor)?;
+        if bucket_count > i32::MAX as u64 {
+            return Err(crate::Error::DataInvalid {
+                message: format!("Invalid deletion vector bitmap count: {bucket_count}"),
                 source: None,
+            });
+        }
+
+        let mut bitmap = RoaringBitmap::new();
+        let mut last_key: Option<u32> = None;
+        for _ in 0..bucket_count {
+            let key = read_u32_le(&mut cursor)?;
+            if key > (i32::MAX as u32 - 1) {
+                return Err(crate::Error::DataInvalid {
+                    message: format!("Deletion vector bitmap key is too large: {key}"),
+                    source: None,
+                });
+            }
+            if last_key.is_some_and(|previous| key <= previous) {
+                return Err(crate::Error::DataInvalid {
+                    message: "Deletion vector bitmap keys must be sorted in ascending order"
+                        .to_string(),
+                    source: None,
+                });
+            }
+            last_key = Some(key);
+
+            let bucket = RoaringBitmap::deserialize_from(&mut cursor).map_err(|e| {
+                crate::Error::DataInvalid {
+                    message: format!("Failed to deserialize 64-bit RoaringBitmap bucket: {e}"),
+                    source: Some(Box::new(e)),
+                }
             })?;
-            bitmap.insert(position);
+            if key > 0 && !bucket.is_empty() {
+                // Positions in bucket `key` are `key << 32 | low`, so anything
+                // above bucket 0 exceeds `u32::MAX`. Rejected rather than
+                // truncated: every API here is roaring32-bound, and reaching one
+                // needs a data file with more than `u32::MAX` rows.
+                let position = (u64::from(key) << 32) | u64::from(bucket.min().unwrap_or(0));
+                return Err(crate::Error::DataInvalid {
+                    message: format!(
+                        "Deletion vector position {position} exceeds u32::MAX, \
+                         which this reader cannot represent"
+                    ),
+                    source: None,
+                });
+            }
+            bitmap |= bucket;
         }
         Ok(Self::from_bitmap(bitmap))
     }
+}
+
+/// Read a little-endian `u64`, advancing `cursor`.
+fn read_u64_le(cursor: &mut &[u8]) -> crate::Result<u64> {
+    let bytes: [u8; 8] = cursor
+        .get(..8)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: "Deletion vector bitmap data truncated".to_string(),
+            source: None,
+        })?;
+    *cursor = &cursor[8..];
+    Ok(u64::from_le_bytes(bytes))
+}
+
+/// Read a little-endian `u32`, advancing `cursor`.
+fn read_u32_le(cursor: &mut &[u8]) -> crate::Result<u32> {
+    let bytes: [u8; 4] = cursor
+        .get(..4)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| crate::Error::DataInvalid {
+            message: "Deletion vector bitmap data truncated".to_string(),
+            source: None,
+        })?;
+    *cursor = &cursor[4..];
+    Ok(u32::from_le_bytes(bytes))
 }
 
 impl Default for DeletionVector {
@@ -370,6 +436,18 @@ mod tests {
         bytes.len() as u64
     }
 
+    /// Wrap a bitmap64 payload in the on-disk envelope Java writes.
+    fn wrap_bitmap64_payload(payload: &[u8]) -> Vec<u8> {
+        let bitmap_length = 4 + payload.len();
+        let mut bytes = (bitmap_length as i32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(&MAGIC_NUMBER_64.to_le_bytes());
+        bytes.extend_from_slice(payload);
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(&bytes[4..]);
+        bytes.extend_from_slice(&(crc.finalize() as i32).to_be_bytes());
+        bytes
+    }
+
     #[test]
     fn test_read_bitmap64_deletion_vector() {
         let bytes = java_bitmap64_bytes(&[&[1u32, 2u32, 9u32]], false);
@@ -390,6 +468,60 @@ mod tests {
             .expect("run-length encoded v2 deletion vector must be readable");
         assert_eq!(dv.cardinality(), run.len() as u64);
         assert!(dv.is_deleted(100) && dv.is_deleted(399) && !dv.is_deleted(400));
+    }
+
+    /// `RoaringTreemap::deserialize_from` would accept a duplicate bucket key and
+    /// let the later bucket replace the earlier one, dropping its deletes; Java
+    /// rejects it in `readKey`. Descending keys and a bogus count are the same
+    /// class of corruption.
+    #[test]
+    fn test_read_bitmap64_rejects_bad_bucket_keys() {
+        // Two buckets both keyed 0: {1} then {2}. Without the check this decodes
+        // to {2} alone and position 1 reads as a live row.
+        let mut payload = 2u64.to_le_bytes().to_vec();
+        for values in [[1u32], [2u32]] {
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            let mut bucket = RoaringBitmap::new();
+            bucket.insert(values[0]);
+            bucket.serialize_into(&mut payload).unwrap();
+        }
+        let bytes = wrap_bitmap64_payload(&payload);
+        let err = DeletionVector::read_from_bytes(&bytes, Some(bytes.len() as u64))
+            .expect_err("a duplicate bucket key must be rejected");
+        assert!(err.to_string().contains("ascending order"), "got: {err}");
+
+        // Descending keys. Bucket 1 is left empty so the order check is what
+        // rejects this, not the `u32::MAX` guard.
+        let mut payload = 2u64.to_le_bytes().to_vec();
+        for (key, values) in [(1u32, &[][..]), (0u32, &[6u32][..])] {
+            payload.extend_from_slice(&key.to_le_bytes());
+            let mut bucket = RoaringBitmap::new();
+            for value in values {
+                bucket.insert(*value);
+            }
+            bucket.serialize_into(&mut payload).unwrap();
+        }
+        let bytes = wrap_bitmap64_payload(&payload);
+        let err = DeletionVector::read_from_bytes(&bytes, Some(bytes.len() as u64))
+            .expect_err("descending bucket keys must be rejected");
+        assert!(err.to_string().contains("ascending order"), "got: {err}");
+
+        // A count larger than i32::MAX cannot be a real bucket count.
+        let payload = (i32::MAX as u64 + 1).to_le_bytes().to_vec();
+        let bytes = wrap_bitmap64_payload(&payload);
+        let err = DeletionVector::read_from_bytes(&bytes, Some(bytes.len() as u64))
+            .expect_err("a bogus bucket count must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Invalid deletion vector bitmap count"),
+            "got: {err}"
+        );
+
+        // A truncated payload must error, not panic.
+        let bytes = wrap_bitmap64_payload(&1u64.to_le_bytes()[..4]);
+        let err = DeletionVector::read_from_bytes(&bytes, Some(bytes.len() as u64))
+            .expect_err("a truncated payload must be rejected");
+        assert!(err.to_string().contains("truncated"), "got: {err}");
     }
 
     #[test]
