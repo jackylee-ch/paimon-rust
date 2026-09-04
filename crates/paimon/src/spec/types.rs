@@ -1838,6 +1838,16 @@ pub struct RowType {
     fields: Vec<DataField>,
 }
 
+/// Quote a row field name the way Java `EncodingUtils.escapeIdentifier` does:
+/// wrap it in backticks and double any backtick it contains.
+///
+/// `spec::escape_identifier` is *not* this function -- it only doubles `"` and adds
+/// no delimiters -- so it cannot be used here. Aligning it instead would be the
+/// tidier fix, but it lives in `schema.rs`, which two open PRs are rewriting.
+fn escape_row_field_name(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
 /// Render one row field the way Java `DataField.asSQLString` does: the escaped
 /// name, a space, the field type's SQL string, then `COMMENT '...'` when the
 /// field carries a description. Java also appends `DEFAULT <value>`, which has no
@@ -1846,7 +1856,7 @@ fn write_row_field(f: &mut Formatter<'_>, field: &DataField) -> std::fmt::Result
     write!(
         f,
         "{} {}",
-        crate::spec::escape_identifier(field.name()),
+        escape_row_field_name(field.name()),
         field.data_type()
     )?;
     if let Some(description) = field.description().filter(|text| !text.is_empty()) {
@@ -2884,7 +2894,7 @@ mod tests {
         ]);
         assert_eq!(
             DataType::Row(row).to_string(),
-            "ROW<id INT, name VARCHAR(10)>"
+            "ROW<`id` INT, `name` VARCHAR(10)>"
         );
 
         let described = RowType::with_nullable(
@@ -2896,15 +2906,33 @@ mod tests {
         );
         assert_eq!(
             DataType::Row(described).to_string(),
-            "ROW<id INT COMMENT 'the ''key'''> NOT NULL"
+            "ROW<`id` INT COMMENT 'the ''key'''> NOT NULL"
         );
 
+        // A double quote is not special to backtick quoting; a backtick is doubled;
+        // a name with a space or a reserved word stays unambiguous.
         let quoted = RowType::new(vec![DataField::new(
             0,
             "we\"ird".to_string(),
             DataType::Int(IntType::new()),
         )]);
-        assert_eq!(DataType::Row(quoted).to_string(), "ROW<we\"\"ird INT>");
+        assert_eq!(DataType::Row(quoted).to_string(), "ROW<`we\"ird` INT>");
+
+        let backticked = RowType::new(vec![DataField::new(
+            0,
+            "a`b".to_string(),
+            DataType::Int(IntType::new()),
+        )]);
+        assert_eq!(DataType::Row(backticked).to_string(), "ROW<`a``b` INT>");
+
+        let spaced = RowType::new(vec![
+            DataField::new(0, "two words".to_string(), DataType::Int(IntType::new())),
+            DataField::new(1, "select".to_string(), DataType::Int(IntType::new())),
+        ]);
+        assert_eq!(
+            DataType::Row(spaced).to_string(),
+            "ROW<`two words` INT, `select` INT>"
+        );
     }
 
     #[test]
