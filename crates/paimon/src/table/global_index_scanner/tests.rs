@@ -1167,6 +1167,118 @@ async fn assert_bitmap_nan_equality_uses_direct_lookup(
     }
 }
 
+async fn assert_bitmap_signed_zero_equality_end_to_end(
+    data_type: DataType,
+    rows: &[(Datum, i64)],
+    positive_zero: Datum,
+    expected: RowRange,
+) {
+    let output = VecFileWrite::new();
+    let captured = output.clone();
+    let mut writer = BitmapGlobalIndexWriter::new(
+        Box::new(output),
+        1,
+        BlockCompressionType::None,
+        make_bitmap_key_comparator(&data_type),
+    );
+    // Only -0.0 is on disk for the zero row; the query asks for +0.0.
+    for (literal, row_id) in rows {
+        writer
+            .write(Some(&serialize_bitmap_datum(literal, &data_type)), *row_id)
+            .unwrap();
+    }
+    let write_result = writer.finish().await.unwrap();
+    let bytes = captured.to_vec();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let index_dir = tmp.path().join("index");
+    std::fs::create_dir_all(&index_dir).unwrap();
+    let file_name = "bitmap-signed-zero.index";
+    std::fs::write(index_dir.join(file_name), &bytes).unwrap();
+    let table_path = format!("file://{}", tmp.path().display());
+    let file_io = crate::io::FileIOBuilder::new("file").build().unwrap();
+
+    let mut entry = make_global_index_entry_with_type(
+        BITMAP_GLOBAL_INDEX_TYPE,
+        file_name,
+        1,
+        100,
+        101,
+        &write_result.meta,
+    );
+    entry.index_file.file_size = bytes.len() as i64;
+    let entries = vec![entry];
+    let fields = vec![DataField::new(1, "id".to_string(), data_type.clone())];
+
+    for (op, literals) in [
+        (PredicateOperator::Eq, vec![positive_zero.clone()]),
+        (PredicateOperator::In, vec![positive_zero.clone()]),
+    ] {
+        let predicates = vec![Predicate::Leaf {
+            column: "id".to_string(),
+            index: 0,
+            data_type: data_type.clone(),
+            op,
+            literals,
+        }];
+        // Fallback scanning disabled, so the file-level prune and the dictionary
+        // lookup must both admit the row on their own.
+        let result = evaluate_global_index_fast_with_fallback_size(
+            &file_io,
+            &table_path,
+            &entries,
+            &predicates,
+            &fields,
+            i64::MAX,
+            0,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result,
+            vec![expected.clone()],
+            "{data_type:?}: {op} on +0.0 must reach the -0.0 row, and only it"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_bitmap_signed_zero_equality_end_to_end() {
+    for (data_type, negative_zero, positive_zero, one) in [
+        (
+            DataType::Float(crate::spec::FloatType::new()),
+            Datum::Float(-0.0),
+            Datum::Float(0.0),
+            Datum::Float(1.0),
+        ),
+        (
+            DataType::Double(crate::spec::DoubleType::new()),
+            Datum::Double(-0.0),
+            Datum::Double(0.0),
+            Datum::Double(1.0),
+        ),
+    ] {
+        // Key range is exactly [-0.0, -0.0], so the file-level min/max check has
+        // to admit the file before the dictionary lookup even runs.
+        assert_bitmap_signed_zero_equality_end_to_end(
+            data_type.clone(),
+            &[(negative_zero.clone(), 0)],
+            positive_zero.clone(),
+            RowRange::new(100, 100),
+        )
+        .await;
+        // Range spans both keys: only the -0.0 row may come back.
+        assert_bitmap_signed_zero_equality_end_to_end(
+            data_type,
+            &[(negative_zero, 0), (one, 1)],
+            positive_zero,
+            RowRange::new(100, 100),
+        )
+        .await;
+    }
+}
+
 #[tokio::test]
 async fn test_bitmap_nan_equality_uses_direct_lookup_with_fallback_scan_disabled() {
     assert_bitmap_nan_equality_uses_direct_lookup(

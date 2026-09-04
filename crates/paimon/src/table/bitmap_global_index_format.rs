@@ -81,6 +81,13 @@ pub(crate) fn serialize_bitmap_datum(datum: &Datum, data_type: &DataType) -> Vec
 /// keys, and the comparator orders `-0.0` below `+0.0`. SQL treats them as equal,
 /// as does the local bitmap file index (`file_index::bitmap`'s `equivalent_zero`),
 /// so an equality lookup has to consult both keys.
+///
+/// Scope: the **scalar** equality operators only. `arrow::residual` compares array
+/// elements bitwise -- matching Java, whose `CompareUtils.compareLiteral` uses
+/// `Float.compareTo` -- so `ARRAY_CONTAINS(+0.0)` must not reach a `-0.0` element
+/// and the array operators stay exact. The sorted (BTree) kind has the same split
+/// in its own key serde, which is a separately persisted contract; closing it
+/// there is left to a follow-up.
 pub(crate) fn opposite_zero_key(key: &[u8], data_type: &DataType) -> Option<Vec<u8>> {
     const F32_SIGN_BIT: u32 = 0x8000_0000;
     const F64_SIGN_BIT: u64 = 0x8000_0000_0000_0000;

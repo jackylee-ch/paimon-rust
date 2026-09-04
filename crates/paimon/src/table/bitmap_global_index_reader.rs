@@ -119,7 +119,7 @@ impl BitmapGlobalIndexReader {
             }
             PredicateOperator::Eq => {
                 let key = serialize_bitmap_datum(&literals[0], data_type);
-                self.equal(&key, data_type).await
+                self.equal_including_signed_zero(&key, data_type).await
             }
             PredicateOperator::NotEq => {
                 let mut result = self.is_not_null().await?;
@@ -128,10 +128,15 @@ impl BitmapGlobalIndexReader {
                 Ok(result)
             }
             PredicateOperator::In => {
-                let keys = literals
+                let mut keys = literals
                     .iter()
                     .map(|literal| serialize_bitmap_datum(literal, data_type))
                     .collect::<Vec<_>>();
+                keys.extend(
+                    keys.clone()
+                        .iter()
+                        .filter_map(|key| opposite_zero_key(key, data_type)),
+                );
                 self.in_keys(&keys, data_type).await
             }
             PredicateOperator::NotIn => {
@@ -271,17 +276,27 @@ impl BitmapGlobalIndexReader {
         self.read_bitmap(self.footer.non_null_rows_block).await
     }
 
-    /// Equality over one key, plus the other signed zero when the key is `±0.0`
-    /// -- the two are separate dictionary entries but compare equal in SQL.
+    /// Exact dictionary lookup for one key.
     async fn equal(&self, key: &[u8], data_type: &DataType) -> io::Result<RoaringTreemap> {
         let logical_cmp = make_bitmap_key_comparator(data_type);
-        let mut result = self
-            .equal_with_comparator(key, logical_cmp.as_ref())
-            .await?;
+        self.equal_with_comparator(key, logical_cmp.as_ref()).await
+    }
+
+    /// Scalar equality: the key plus the other signed zero when it is `±0.0`.
+    ///
+    /// Only for the scalar operators. The row-level filter compares a scalar
+    /// through Arrow's IEEE kernel, where `-0.0 == 0.0`, so the index has to admit
+    /// both keys or it drops rows the filter would keep. Array membership is
+    /// deliberately *bitwise* in `arrow::residual` (Java compares elements with
+    /// `Float.compareTo`), so the array operators must not widen.
+    async fn equal_including_signed_zero(
+        &self,
+        key: &[u8],
+        data_type: &DataType,
+    ) -> io::Result<RoaringTreemap> {
+        let mut result = self.equal(key, data_type).await?;
         if let Some(other_zero) = opposite_zero_key(key, data_type) {
-            result |= self
-                .equal_with_comparator(&other_zero, logical_cmp.as_ref())
-                .await?;
+            result |= self.equal(&other_zero, data_type).await?;
         }
         Ok(result)
     }
@@ -299,10 +314,6 @@ impl BitmapGlobalIndexReader {
 
     async fn in_keys(&self, keys: &[Vec<u8>], data_type: &DataType) -> io::Result<RoaringTreemap> {
         let mut sorted_keys = keys.to_vec();
-        sorted_keys.extend(
-            keys.iter()
-                .filter_map(|key| opposite_zero_key(key, data_type)),
-        );
         sorted_keys.sort();
         sorted_keys.dedup();
 
@@ -1069,20 +1080,40 @@ mod tests {
         negative_zero: Datum,
         positive_zero: Datum,
         one: Datum,
+        minus_one: Datum,
     ) {
         // Dictionary holds -0.0 only.
         let (reader, _) =
             write_and_read_entries(&data_type, &[(negative_zero.clone(), 7), (one.clone(), 9)])
                 .await;
-        for op in [PredicateOperator::Eq, PredicateOperator::ArrayContains] {
+        let rows = reader
+            .query(
+                PredicateOperator::Eq,
+                std::slice::from_ref(&positive_zero),
+                &data_type,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().collect::<Vec<_>>(),
+            vec![7],
+            "Eq on +0.0 must match a -0.0 key ({data_type:?})"
+        );
+
+        // Array membership is bitwise at the row level, so the array operators
+        // must stay exact: `-0.0` is not an occurrence of `+0.0`.
+        for op in [
+            PredicateOperator::ArrayContains,
+            PredicateOperator::ArraysOverlap,
+            PredicateOperator::ArrayContainsAll,
+        ] {
             let rows = reader
                 .query(op, std::slice::from_ref(&positive_zero), &data_type)
                 .await
                 .unwrap();
-            assert_eq!(
-                rows.iter().collect::<Vec<_>>(),
-                vec![7],
-                "{op} on +0.0 must match a -0.0 key ({data_type:?})"
+            assert!(
+                rows.is_empty(),
+                "{op} on +0.0 must not widen onto the -0.0 key ({data_type:?})"
             );
         }
         let rows = reader
@@ -1095,10 +1126,18 @@ mod tests {
             .unwrap();
         assert_eq!(rows.iter().collect::<Vec<_>>(), vec![7, 9]);
 
-        // Dictionary holds +0.0 only: the other direction must hold too.
-        let (reader, _) =
-            write_and_read_entries(&data_type, &[(positive_zero.clone(), 3), (one.clone(), 5)])
-                .await;
+        // Dictionary holds +0.0 only: the other direction must hold too. `minus_one`
+        // is present so the non-zero assertion below can catch a widening that is
+        // not restricted to the two zeros.
+        let (reader, _) = write_and_read_entries(
+            &data_type,
+            &[
+                (positive_zero.clone(), 3),
+                (one.clone(), 5),
+                (minus_one.clone(), 11),
+            ],
+        )
+        .await;
         let rows = reader
             .query(
                 PredicateOperator::Eq,
@@ -1113,7 +1152,7 @@ mod tests {
             "Eq on -0.0 must match a +0.0 key ({data_type:?})"
         );
 
-        // A non-zero literal is unaffected.
+        // A non-zero literal must not be widened onto its sign-flipped twin.
         let rows = reader
             .query(
                 PredicateOperator::Eq,
@@ -1122,7 +1161,20 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![5]);
+        assert_eq!(
+            rows.iter().collect::<Vec<_>>(),
+            vec![5],
+            "1.0 must not pick up the -1.0 row ({data_type:?})"
+        );
+        let rows = reader
+            .query(
+                PredicateOperator::Eq,
+                std::slice::from_ref(&minus_one),
+                &data_type,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![11]);
     }
 
     #[tokio::test]
@@ -1132,6 +1184,7 @@ mod tests {
             Datum::Float(-0.0),
             Datum::Float(0.0),
             Datum::Float(1.0),
+            Datum::Float(-1.0),
         )
         .await;
         assert_signed_zeros_match_each_other(
@@ -1139,6 +1192,7 @@ mod tests {
             Datum::Double(-0.0),
             Datum::Double(0.0),
             Datum::Double(1.0),
+            Datum::Double(-1.0),
         )
         .await;
     }
